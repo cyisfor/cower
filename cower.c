@@ -272,7 +272,7 @@ static void print_pkg_formatted(struct aurpkg_t*);
 static void print_pkg_info(struct aurpkg_t*);
 static void print_pkg_search(struct aurpkg_t*);
 static void print_results(alpm_list_t*, void (*)(struct aurpkg_t*));
-static int read_targets_from_file(FILE *in, alpm_list_t **targets);
+static int read_targets_from_file(FILE *in);
 static int resolve_dependencies(CURL*, const char*, const char*);
 static int set_working_dir(void);
 static int strings_init(void);
@@ -311,6 +311,7 @@ static struct {
 	int (*sort_fn) (const struct aurpkg_t*, const struct aurpkg_t*);
 
 	alpm_list_t *targets;
+	alpm_list_t *negatargets;
 	struct {
 	  alpm_list_t *pkgs;
 	  alpm_list_t *repos;
@@ -915,6 +916,32 @@ alpm_list_t *filter_results(alpm_list_t *list)
 		list = filterlist;
 	}
 
+	for(i = cfg.negatargets; i; i = alpm_list_next(i)) {
+				regex_t regex;
+		const char *targ = i->data;
+		filterlist = NULL;
+
+		if(regcomp(&regex, targ, kRegexOpts) == 0) {
+			for(j = list; j; j = alpm_list_next(j)) {
+				struct aurpkg_t *pkg = j->data;
+				const char *name = pkg->name;
+				const char *desc = pkg->desc;
+
+				if(regexec(&regex, name, 0, 0, 0) != REG_NOMATCH ||
+						regexec(&regex, desc, 0, 0, 0) != REG_NOMATCH) {
+					aurpkg_free(pkg);
+				} else {
+					filterlist = alpm_list_add(filterlist, pkg);
+				}
+			}
+			regfree(&regex);
+		}
+		
+		/* switcheroo */
+		alpm_list_free(list);
+		list = filterlist;
+	}
+
 	return alpm_list_msort(filterlist, alpm_list_count(filterlist), aurpkg_cmp);
 }
 
@@ -1216,6 +1243,7 @@ alpm_list_t *load_targets_from_files(alpm_list_t *files)
 
 		sanitized[strcspn(sanitized, "<>=")] = '\0';
 		if(!alpm_list_find_str(targets, sanitized)) {
+			/* this is a PKGBUILD again, so no add_target */
 			targets = alpm_list_add(targets, sanitized);
 		}
 	}
@@ -1447,6 +1475,23 @@ finish:
 	return ret;
 }
 
+void add_target(const char* target) {
+	if(*target == '^') {
+		++target;
+		if(*target != '^') {
+			if(!alpm_list_find_str(cfg.negatargets, target)) {
+				cwr_printf(LOG_DEBUG, "adding negative search target: %s\n", target);
+				cfg.negatargets = alpm_list_add(cfg.negatargets, strdup(target));
+			}
+			return;
+		}
+	}
+	if(!alpm_list_find_str(cfg.targets, target)) {
+		cwr_printf(LOG_DEBUG, "adding target: %s\n", target);
+		cfg.targets = alpm_list_add(cfg.targets, strdup(target));
+	}
+}
+
 int parse_options(int argc, char *argv[])
 {
 	int opt, option_index = 0;
@@ -1625,11 +1670,7 @@ int parse_options(int argc, char *argv[])
 	}
 
 	while(optind < argc) {
-		if(!alpm_list_find_str(cfg.targets, argv[optind])) {
-			cwr_printf(LOG_DEBUG, "adding target: %s\n", argv[optind]);
-			cfg.targets = alpm_list_add(cfg.targets, strdup(argv[optind]));
-		}
-		optind++;
+		add_target(argv[optind++]);
 	}
 
 	return 0;
@@ -2053,6 +2094,8 @@ int resolve_dependencies(CURL *curl, const char *pkgname, const char *subdir)
 
 		sanitized[strcspn(sanitized, "<>=")] = '\0';
 
+		/* could use add_target here allowing a PKGBUILD to exclude other packages,
+		 * but that sounds pretty dumb. */
 		if(!alpm_list_find_str(cfg.targets, sanitized)) {
 			pthread_mutex_lock(&listlock);
 			cfg.targets = alpm_list_add(cfg.targets, sanitized);
@@ -2436,7 +2479,7 @@ static char *url_escape(char *in, int len, const char *delim)
 void usage(void)
 {
 	fprintf(stderr, "cower %s\n"
-	    "Usage: cower <operations> [options] target...\n\n", COWER_VERSION);
+	    "Usage: cower <operations> [options] target ^target...\n\n", COWER_VERSION);
 	fprintf(stderr,
 	    " Operations:\n"
 	    "  -d, --download          download target(s) -- pass twice to "
@@ -2467,7 +2510,11 @@ void usage(void)
 	    "      --rsort <key>       sort results in descending order by key\n"
 	    "      --listdelim <delim> change list format delimeter\n"
 	    "  -q, --quiet             output less\n"
-	    "  -v, --verbose           output more\n\n");
+	    "  -v, --verbose           output more\n\n"
+			"While searching, prefix a target with ^ to show only packages that do NOT match the target.\n"
+			"A prefix of ^^ will be interpreted as a literal ^.\n"
+			"  ^^target becomes '^target'\n"
+			"  ^^^target becomes '^^target' etc\n\n");
 }
 
 void version(void)
@@ -2494,7 +2541,7 @@ size_t yajl_parse_stream(void *ptr, size_t size, size_t nmemb, void *stream)
 	return realsize;
 }
 
-int read_targets_from_file(FILE *in, alpm_list_t **targets) {
+int read_targets_from_file(FILE *in) {
 	char line[BUFSIZ];
 	int i = 0, end = 0;
 	while(!end) {
@@ -2508,10 +2555,7 @@ int read_targets_from_file(FILE *in, alpm_list_t **targets) {
 			line[i] = '\0';
 			/* avoid adding zero length arg, if multiple spaces separate args */
 			if(i > 0) {
-				if(!alpm_list_find_str(*targets, line)) {
-					cwr_printf(LOG_DEBUG, "adding target: %s\n", line);
-					*targets = alpm_list_add(*targets, strdup(line));
-				}
+				add_target(line);
 				i = 0;
 			}
 		} else {
@@ -2577,7 +2621,7 @@ int main(int argc, char *argv[]) {
 		cfg.targets = alpm_list_remove_str(cfg.targets, "-", &vdata);
 		free(vdata);
 		cwr_printf(LOG_DEBUG, "reading targets from stdin\n");
-		ret = read_targets_from_file(stdin, &cfg.targets);
+		ret = read_targets_from_file(stdin);
 		if(ret != 0) {
 			goto finish;
 		}
